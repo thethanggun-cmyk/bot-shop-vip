@@ -1,6 +1,2 @@
-Flask
-gunicorn
-requests
-pyTelegramBotAPI
-pymongo
-dnspython
+python-telegram-bot>=20.0
+pymongo>=4.0
