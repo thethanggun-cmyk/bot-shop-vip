@@ -1,0 +1,1187 @@
+import os
+import json
+import time
+import threading
+import sys
+from datetime import datetime
+from flask import Flask, jsonify, request, send_from_directory
+import telebot
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+
+app = Flask(__name__, static_folder=".")
+
+BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+if not BOT_TOKEN:
+    print("❌ LỖI: TELEGRAM_TOKEN chưa được set! Vui lòng thêm biến môi trường TELEGRAM_TOKEN.")
+    sys.exit(1)
+
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "8348411770"))
+
+# === BOT ===
+try:
+    bot = telebot.TeleBot(BOT_TOKEN)
+    print("✅ Bot Telegram đã được khởi tạo thành công!")
+except Exception as e:
+    print("❌ Lỗi khởi tạo bot:", e)
+    sys.exit(1)
+
+# === Biến lưu giá acc LV5 ===
+ACC_PRICE = 1600
+
+# === MongoDB ===
+MONGO_URI = os.environ.get("MONGO_URI", "")
+db = None
+file_lock = threading.Lock()
+
+if MONGO_URI:
+    try:
+        from pymongo import MongoClient, ASCENDING, DESCENDING
+        client = MongoClient(MONGO_URI)
+        db = client["gun_store"]
+        db.users.create_index([("userId", ASCENDING)], unique=True)
+        db.accounts.create_index([("_id", ASCENDING)])
+        db.accounts_free.create_index([("_id", ASCENDING)])
+        db.purchases.create_index([("userId", ASCENDING), ("timestamp", DESCENDING)])
+        db.deposits.create_index([("userId", ASCENDING), ("timestamp", DESCENDING)])
+        db.invite_history.create_index([("raw_time", DESCENDING)])
+        config = db.config.find_one({"key": "acc_price"})
+        if config:
+            ACC_PRICE = config.get("value", 1600)
+        else:
+            db.config.insert_one({"key": "acc_price", "value": 1600})
+        print("✅ Đã kết nối MongoDB và tạo index thành công!")
+    except Exception as e:
+        print("❌ Lỗi kết nối MongoDB:", e)
+
+# === Định nghĩa file ===
+ACC_FILE = "acclv5.txt"
+ACC_FREE_FILE = "acclv5_free.txt"
+USERS_FILE = "users.json"
+DEPOSITS_FILE = "deposits.json"
+PURCHASES_FILE = "purchases.json"
+INVITE_HISTORY_FILE = "invite_history.json"
+CONFIG_FILE = "config.json"
+
+def ensure_local_files():
+    for f in [ACC_FILE, ACC_FREE_FILE, USERS_FILE, DEPOSITS_FILE, PURCHASES_FILE, INVITE_HISTORY_FILE, CONFIG_FILE]:
+        if not os.path.exists(f):
+            with open(f, "w", encoding="utf-8") as _:
+                if f == CONFIG_FILE:
+                    json.dump({"acc_price": 1600}, _)
+                elif f.endswith(".json"):
+                    json.dump([], _) if f in [DEPOSITS_FILE, PURCHASES_FILE, INVITE_HISTORY_FILE] else json.dump({}, _)
+
+# === Hàm gửi tin nhắn có retry ===
+def send_message_with_retry(chat_id, text, parse_mode='Markdown', retries=3, delay=2):
+    for attempt in range(retries):
+        try:
+            bot.send_message(chat_id, text, parse_mode=parse_mode)
+            return True
+        except Exception as e:
+            print(f"❌ Lỗi gửi tin nhắn cho {chat_id} (lần {attempt+1}/{retries}): {e}")
+            if attempt < retries - 1:
+                time.sleep(delay)
+    return False
+
+# === BOT HANDLERS ===
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    print(f"📩 Nhận lệnh /start từ {message.from_user.id}")
+    user_id = str(message.chat.id)
+    username = message.from_user.username or message.from_user.first_name or "User"
+
+    if db is not None:
+        db.users.update_one({"userId": user_id}, {"$set": {"username": username}}, upsert=True)
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                users = json.load(f)
+            if user_id not in users:
+                users[user_id] = {"balance": 0, "coins": 0}
+            users[user_id]["username"] = username
+            with open(USERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(users, f, indent=2)
+
+    args = message.text.split()
+    ref_id = args[1] if len(args) > 1 else ""
+    web_app_url = f"https://t.me/guncpwstore_bot/gunminiapp?startapp={ref_id}" if ref_id else "https://t.me/guncpwstore_bot/gunminiapp"
+
+    markup = InlineKeyboardMarkup()
+    btn_miniapp = InlineKeyboardButton("🚀 Mở Mini App", url=web_app_url)
+    btn_admin = InlineKeyboardButton("👑 Admin", callback_data="admin_info")
+    markup.add(btn_miniapp)
+    markup.add(btn_admin)
+
+    welcome_text = "👋 Chào mừng bạn đến với **Gun Store**!\nBấm vào nút bên dưới để mở Mini App và trải nghiệm nhé!"
+    bot.reply_to(message, welcome_text, parse_mode="Markdown", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data == "admin_info")
+def admin_callback(call):
+    bot.answer_callback_query(call.id)
+    bot.send_message(call.message.chat.id, "👑 Admin : @guncpw")
+
+@bot.message_handler(commands=['coin'])
+def set_coin(message):
+    if message.from_user.id != ADMIN_ID: return
+    args = message.text.split()
+    if len(args) < 3:
+        bot.reply_to(message, "⚠️ Cú pháp: `/coin <@username_hoặc_ID> <số_coin>`", parse_mode="Markdown")
+        return
+    target = args[1].replace('@', '').strip()
+    try:
+        amount = int(args[2])
+    except ValueError:
+        bot.reply_to(message, "⚠️ Số coin phải là một số nguyên!")
+        return
+
+    if db is not None:
+        user = db.users.find_one({"$or": [{"userId": target}, {"username": target}]})
+        target_id = user["userId"] if user else target
+        db.users.update_one({"userId": target_id}, {"$inc": {"coins": amount}}, upsert=True)
+        bot.reply_to(message, f"✅ Đã thay đổi **{amount:+} Coin** cho User `{target_id}`!", parse_mode="Markdown")
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                users = json.load(f)
+            target_id = target
+            for uid, udata in users.items():
+                if udata.get("username") == target:
+                    target_id = uid
+                    break
+            if target_id not in users:
+                users[target_id] = {"balance": 0, "coins": 0}
+            users[target_id]["coins"] = users[target_id].get("coins", 0) + amount
+            with open(USERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(users, f, indent=2)
+        bot.reply_to(message, f"✅ Đã thay đổi **{amount:+} Coin** cho User `{target_id}`!", parse_mode="Markdown")
+
+@bot.message_handler(commands=['congtien'])
+def cong_tien(message):
+    if message.from_user.id != ADMIN_ID: return
+    args = message.text.split()
+    if len(args) < 3:
+        bot.reply_to(message, "⚠️ Cú pháp: `/congtien <@username_hoặc_ID> <số_tiền>`", parse_mode="Markdown")
+        return
+    target = args[1].replace('@', '').strip()
+    try:
+        amount = int(args[2])
+        if amount <= 0:
+            bot.reply_to(message, "⚠️ Số tiền phải lớn hơn 0!")
+            return
+    except ValueError:
+        bot.reply_to(message, "⚠️ Số tiền phải là một số nguyên!")
+        return
+
+    if db is not None:
+        user = db.users.find_one({"$or": [{"userId": target}, {"username": target}]})
+        if not user:
+            bot.reply_to(message, f"❌ Không tìm thấy user `{target}`!")
+            return
+        target_id = user["userId"]
+        db.users.update_one({"userId": target_id}, {"$inc": {"balance": amount}}, upsert=True)
+        bot.reply_to(message, f"✅ Đã cộng **{amount:,}đ** cho User `{target_id}` (Tên: @{user.get('username', target_id)})!", parse_mode="Markdown")
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                users = json.load(f)
+            target_id = target
+            for uid, udata in users.items():
+                if udata.get("username") == target:
+                    target_id = uid
+                    break
+            if target_id not in users:
+                bot.reply_to(message, f"❌ Không tìm thấy user `{target}`!")
+                return
+            users[target_id]["balance"] = users[target_id].get("balance", 0) + amount
+            with open(USERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(users, f, indent=2)
+        bot.reply_to(message, f"✅ Đã cộng **{amount:,}đ** cho User `{target_id}`!", parse_mode="Markdown")
+
+@bot.message_handler(commands=['trutien'])
+def tru_tien(message):
+    if message.from_user.id != ADMIN_ID: return
+    args = message.text.split()
+    if len(args) < 3:
+        bot.reply_to(message, "⚠️ Cú pháp: `/trutien <@username_hoặc_ID> <số_tiền>`", parse_mode="Markdown")
+        return
+    target = args[1].replace('@', '').strip()
+    try:
+        amount = int(args[2])
+        if amount <= 0:
+            bot.reply_to(message, "⚠️ Số tiền phải lớn hơn 0!")
+            return
+    except ValueError:
+        bot.reply_to(message, "⚠️ Số tiền phải là một số nguyên!")
+        return
+
+    if db is not None:
+        user = db.users.find_one({"$or": [{"userId": target}, {"username": target}]})
+        if not user:
+            bot.reply_to(message, f"❌ Không tìm thấy user `{target}`!")
+            return
+        target_id = user["userId"]
+        current_balance = user.get("balance", 0)
+        if current_balance < amount:
+            bot.reply_to(message, f"⚠️ User `{target_id}` chỉ có {current_balance:,}đ, không đủ để trừ {amount:,}đ!", parse_mode="Markdown")
+            return
+        db.users.update_one({"userId": target_id}, {"$inc": {"balance": -amount}}, upsert=True)
+        bot.reply_to(message, f"✅ Đã trừ **{amount:,}đ** của User `{target_id}` (Tên: @{user.get('username', target_id)})!", parse_mode="Markdown")
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                users = json.load(f)
+            target_id = target
+            for uid, udata in users.items():
+                if udata.get("username") == target:
+                    target_id = uid
+                    break
+            if target_id not in users:
+                bot.reply_to(message, f"❌ Không tìm thấy user `{target}`!")
+                return
+            current_balance = users[target_id].get("balance", 0)
+            if current_balance < amount:
+                bot.reply_to(message, f"⚠️ User `{target_id}` chỉ có {current_balance:,}đ, không đủ để trừ {amount:,}đ!", parse_mode="Markdown")
+                return
+            users[target_id]["balance"] = current_balance - amount
+            with open(USERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(users, f, indent=2)
+        bot.reply_to(message, f"✅ Đã trừ **{amount:,}đ** của User `{target_id}`!", parse_mode="Markdown")
+
+@bot.message_handler(commands=['user'])
+def list_users(message):
+    if message.from_user.id != ADMIN_ID: return
+    try:
+        if db is not None:
+            users_cursor = db.users.find({}, {"_id": 0}).limit(100)
+            users_list = list(users_cursor)
+        else:
+            with file_lock:
+                ensure_local_files()
+                with open(USERS_FILE, "r", encoding="utf-8") as f:
+                    users = json.load(f)
+            users_list = [{"userId": k, **v} for k, v in list(users.items())[:100]]
+
+        if not users_list:
+            bot.reply_to(message, "📂 Chưa có người dùng nào trên hệ thống.")
+            return
+
+        msg = f"📊 **DANH SÁCH NGƯỜI DÙNG (hiển thị {len(users_list)} user đầu tiên)**:\n\n"
+        for idx, u in enumerate(users_list, start=1):
+            uname = f"@{u.get('username')}" if u.get('username') else "Không có"
+            uid = u.get("userId", "N/A")
+            bal = u.get("balance", 0)
+            coins = u.get("coins", 0)
+            msg += f"{idx}. **User**: {uname}\n   ├ **ID**: `{uid}`\n   ├ **Số dư**: {bal:,}đ\n   └ **Coin**: {coins} 🪙\n\n"
+
+        if len(msg) > 4000:
+            parts = [msg[i:i+4000] for i in range(0, len(msg), 4000)]
+            for part in parts:
+                bot.send_message(message.chat.id, part, parse_mode="Markdown")
+        else:
+            bot.reply_to(message, msg, parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"❌ Lỗi khi lấy danh sách user: {str(e)}")
+        print(f"❌ Lỗi trong list_users: {e}")
+
+@bot.message_handler(commands=['thongbao'])
+def broadcast_message(message):
+    if message.from_user.id != ADMIN_ID: return
+    content = message.text.replace('/thongbao', '').strip()
+    if not content:
+        bot.reply_to(message, "⚠️ Cú pháp: `/thongbao <nội dung thông báo>`", parse_mode="Markdown")
+        return
+
+    if db is not None:
+        users_ids = [u["userId"] for u in db.users.find({}, {"userId": 1})]
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                users = json.load(f)
+        users_ids = list(users.keys())
+
+    success_count = 0
+    for uid in set(users_ids):
+        try:
+            bot.send_message(uid, f"📢 **THÔNG BÁO TỪ ADMIN**\n\n{content}", parse_mode="Markdown")
+            success_count += 1
+            time.sleep(0.05)
+        except Exception:
+            pass
+
+    bot.reply_to(message, f"✅ Đã gửi thông báo thành công tới {success_count} người dùng!")
+
+@bot.message_handler(commands=['ban'])
+def ban_user(message):
+    if message.from_user.id != ADMIN_ID: return
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "⚠️ Cú pháp: `/ban <ID_hoặc_@username>`", parse_mode="Markdown")
+        return
+    target = args[1].replace('@', '').strip()
+
+    if db is not None:
+        user = db.users.find_one({"$or": [{"userId": target}, {"username": target}]})
+        target_id = user["userId"] if user else target
+        db.users.update_one({"userId": target_id}, {"$set": {"is_banned": True}}, upsert=True)
+        bot.reply_to(message, f"🚫 Đã cấm `{target_id}` đổi Acc Free Lv5!")
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                users = json.load(f)
+            if target not in users:
+                users[target] = {}
+            users[target]["is_banned"] = True
+            with open(USERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(users, f, indent=2)
+        bot.reply_to(message, f"🚫 Đã cấm `{target}` đổi Acc Free Lv5!")
+
+@bot.message_handler(commands=['unban'])
+def unban_user(message):
+    if message.from_user.id != ADMIN_ID: return
+    args = message.text.split()
+    if len(args) < 2:
+        bot.reply_to(message, "⚠️ Cú pháp: `/unban <ID_hoặc_@username>`", parse_mode="Markdown")
+        return
+    target = args[1].replace('@', '').strip()
+
+    if db is not None:
+        user = db.users.find_one({"$or": [{"userId": target}, {"username": target}]})
+        target_id = user["userId"] if user else target
+        db.users.update_one({"userId": target_id}, {"$set": {"is_banned": False}})
+        bot.reply_to(message, f"✅ Đã gỡ cấm cho `{target_id}`!")
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                users = json.load(f)
+            if target in users:
+                users[target]["is_banned"] = False
+            with open(USERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(users, f, indent=2)
+        bot.reply_to(message, f"✅ Đã gỡ cấm cho `{target}`!")
+
+def run_bot():
+    retry_delay = 5
+    while True:
+        try:
+            print("🤖 Bot Telegram đang lắng nghe tin nhắn...")
+            bot.infinity_polling(skip_pending=True, timeout=60)
+        except Exception as e:
+            print(f"❌ Lỗi Bot Telegram: {e}")
+            time.sleep(retry_delay)
+            retry_delay = min(retry_delay * 2, 60)
+
+bot_thread = threading.Thread(target=run_bot, daemon=True)
+bot_thread.start()
+
+# === FLASK ROUTES ===
+@app.route("/")
+def index():
+    if os.path.exists("index.html"):
+        return send_from_directory(".", "index.html")
+    return "<h3>Lỗi: Không tìm thấy file index.html!</h3>", 404
+
+@app.route("/music.mp3")
+def serve_music():
+    if os.path.exists("music.mp3"):
+        return send_from_directory(".", "music.mp3")
+    return "No music file found", 404
+
+@app.route("/video.mp4")
+def serve_video():
+    if os.path.exists("video.mp4"):
+        return send_from_directory(".", "video.mp4")
+    return "No video file found", 404
+
+# === API ===
+@app.route("/get-user-info", methods=["GET"])
+def get_user_info():
+    user_id = str(request.args.get("userId", ""))
+    username = str(request.args.get("userName", ""))
+    ref_by = str(request.args.get("refBy", ""))
+    print(f"🔍 get-user-info: userId={user_id}, refBy={ref_by}")
+
+    if not user_id:
+        return jsonify({"success": False, "balance": 0, "coins": 0})
+
+    if db is not None:
+        user = db.users.find_one_and_update(
+            {"userId": user_id},
+            {"$setOnInsert": {
+                "username": username,
+                "balance": 0,
+                "coins": 0,
+                "referred_by": ref_by if (ref_by and ref_by != user_id) else "",
+                "is_banned": False,
+                "confirmed_invite": False
+            }},
+            upsert=True,
+            return_document=True
+        )
+        if username and user.get("username") != username:
+            db.users.update_one({"userId": user_id}, {"$set": {"username": username}})
+        return jsonify({
+            "success": True,
+            "balance": user.get("balance", 0),
+            "coins": user.get("coins", 0),
+            "confirmed_invite": user.get("confirmed_invite", False)
+        })
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                users = json.load(f)
+            if user_id not in users:
+                users[user_id] = {
+                    "username": username,
+                    "balance": 0,
+                    "coins": 0,
+                    "referred_by": ref_by if (ref_by and ref_by != user_id) else "",
+                    "is_banned": False,
+                    "confirmed_invite": False
+                }
+                with open(USERS_FILE, "w", encoding="utf-8") as fw:
+                    json.dump(users, fw, indent=2)
+            else:
+                if username and users[user_id].get("username") != username:
+                    users[user_id]["username"] = username
+                    with open(USERS_FILE, "w", encoding="utf-8") as fw:
+                        json.dump(users, fw, indent=2)
+            u = users[user_id]
+        return jsonify({
+            "success": True,
+            "balance": u.get("balance", 0),
+            "coins": u.get("coins", 0),
+            "confirmed_invite": u.get("confirmed_invite", False)
+        })
+
+@app.route("/confirm-invite", methods=["POST"])
+def confirm_invite():
+    data = request.json or {}
+    user_id = str(data.get("userId", ""))
+    ref_by = str(data.get("refBy", ""))
+    if not user_id or not ref_by or ref_by == user_id:
+        return jsonify({"success": False, "message": "Dữ liệu không hợp lệ!"}), 400
+
+    try:
+        if db is not None:
+            user = db.users.find_one({"userId": user_id})
+            if not user:
+                return jsonify({"success": False, "message": "Không tìm thấy người dùng!"}), 400
+            if user.get("confirmed_invite", False):
+                return jsonify({"success": False, "message": "Bạn đã xác nhận mời trước đó rồi!"}), 400
+
+            db.users.update_one({"userId": ref_by}, {"$inc": {"coins": 1}}, upsert=True)
+            db.users.update_one({"userId": user_id}, {"$set": {"confirmed_invite": True}})
+
+            ref_user = db.users.find_one({"userId": ref_by}) or {}
+            new_user = db.users.find_one({"userId": user_id}) or {}
+            ref_username = ref_user.get("username", ref_by)
+            new_username = new_user.get("username", user_id)
+
+            db.invite_history.insert_one({
+                "inviter_id": ref_by,
+                "inviter_username": ref_username,
+                "invited_id": user_id,
+                "invited_username": new_username,
+                "timestamp": time.strftime("%H:%M - %d/%m/%Y"),
+                "raw_time": time.time()
+            })
+
+            msg_to_ref = f"🎉 **XÁC NHẬN MỜI THÀNH CÔNG!**\n\nBạn đã mời thành công @{new_username} (ID: `{user_id}`).\nBạn đã được cộng **+1 Coin**!"
+            send_message_with_retry(ref_by, msg_to_ref)
+
+            msg_to_admin = f"🔔 **THÔNG BÁO MỜI THÀNH CÔNG**\nUser @{ref_username} (ID: `{ref_by}`) đã mời thành công user @{new_username} (ID: `{user_id}`) vào Mini App (đã xác nhận qua câu đố)!"
+            send_message_with_retry(ADMIN_ID, msg_to_admin)
+
+            return jsonify({"success": True, "message": "Cảm ơn bạn đã xác nhận! Người giới thiệu đã nhận được 1 Coin."})
+        else:
+            with file_lock:
+                ensure_local_files()
+                with open(USERS_FILE, "r", encoding="utf-8") as f:
+                    users = json.load(f)
+                if user_id not in users:
+                    return jsonify({"success": False, "message": "Không tìm thấy người dùng!"}), 400
+                if users[user_id].get("confirmed_invite", False):
+                    return jsonify({"success": False, "message": "Bạn đã xác nhận mời trước đó rồi!"}), 400
+
+                if ref_by in users:
+                    users[ref_by]["coins"] = users[ref_by].get("coins", 0) + 1
+                else:
+                    users[ref_by] = {"balance": 0, "coins": 1}
+                users[user_id]["confirmed_invite"] = True
+                with open(USERS_FILE, "w", encoding="utf-8") as f:
+                    json.dump(users, f, indent=2)
+
+                ref_username = users[ref_by].get("username", ref_by)
+                new_username = users[user_id].get("username", user_id)
+
+                with open(INVITE_HISTORY_FILE, "r", encoding="utf-8") as f:
+                    history = json.load(f)
+                history.append({
+                    "inviter_id": ref_by,
+                    "inviter_username": ref_username,
+                    "invited_id": user_id,
+                    "invited_username": new_username,
+                    "timestamp": time.strftime("%H:%M - %d/%m/%Y"),
+                    "raw_time": time.time()
+                })
+                with open(INVITE_HISTORY_FILE, "w", encoding="utf-8") as f:
+                    json.dump(history, f, indent=2)
+
+            msg_to_ref = f"🎉 **XÁC NHẬN MỜI THÀNH CÔNG!**\n\nBạn đã mời thành công @{new_username} (ID: `{user_id}`).\nBạn đã được cộng **+1 Coin**!"
+            send_message_with_retry(ref_by, msg_to_ref)
+
+            msg_to_admin = f"🔔 **THÔNG BÁO MỜI THÀNH CÔNG**\nUser @{ref_username} (ID: `{ref_by}`) đã mời thành công user @{new_username} (ID: `{user_id}`) vào Mini App (đã xác nhận qua câu đố)!"
+            send_message_with_retry(ADMIN_ID, msg_to_admin)
+
+            return jsonify({"success": True, "message": "Cảm ơn bạn đã xác nhận! Người giới thiệu đã nhận được 1 Coin."})
+    except Exception as e:
+        print(f"❌ Lỗi trong confirm_invite: {e}")
+        return jsonify({"success": False, "message": "Lỗi server, vui lòng thử lại sau!"}), 500
+
+@app.route("/admin/get-invite-history", methods=["GET"])
+def admin_get_invite_history():
+    user_id = request.args.get("userId", "")
+    if str(user_id) != str(ADMIN_ID):
+        return jsonify({"success": False, "message": "Không có quyền truy cập!"}), 403
+
+    if db is not None:
+        records = list(db.invite_history.find({}, {"_id": 0}).sort("raw_time", -1).limit(100))
+        return jsonify({"success": True, "history": records})
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(INVITE_HISTORY_FILE, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        history.sort(key=lambda x: x.get("raw_time", 0), reverse=True)
+        return jsonify({"success": True, "history": history[:100]})
+
+@app.route("/admin/get-users", methods=["GET"])
+def admin_get_users():
+    user_id = request.args.get("userId", "")
+    if str(user_id) != str(ADMIN_ID):
+        return jsonify({"success": False, "message": "Không có quyền truy cập!"}), 403
+
+    page = int(request.args.get("page", 1))
+    limit = int(request.args.get("limit", 10))
+    skip = (page - 1) * limit
+
+    if db is not None:
+        total = db.users.count_documents({})
+        users_cursor = db.users.find({}, {"_id": 0}).skip(skip).limit(limit)
+        users_list = list(users_cursor)
+        return jsonify({
+            "success": True,
+            "users": users_list,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "total_pages": (total + limit - 1) // limit
+        })
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                users = json.load(f)
+        total = len(users)
+        users_items = list(users.items())
+        paginated = users_items[skip:skip+limit]
+        users_list = [{"userId": k, **v} for k, v in paginated]
+        return jsonify({
+            "success": True,
+            "users": users_list,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "total_pages": (total + limit - 1) // limit
+        })
+
+@app.route("/admin/manage-user", methods=["POST"])
+def admin_manage_user():
+    data = request.json or {}
+    admin_id = data.get("adminId", "")
+    if str(admin_id) != str(ADMIN_ID):
+        return jsonify({"success": False, "message": "Không có quyền!"}), 403
+
+    target_user = data.get("userId", "")
+    new_balance = data.get("balance")
+    new_coins = data.get("coins")
+
+    if not target_user:
+        return jsonify({"success": False, "message": "Thiếu userId!"}), 400
+
+    if db is not None:
+        user = db.users.find_one({"userId": target_user})
+        if not user:
+            return jsonify({"success": False, "message": "Không tìm thấy user!"}), 400
+
+        update_data = {}
+        if new_balance is not None:
+            try:
+                bal = int(new_balance)
+                if bal < 0:
+                    return jsonify({"success": False, "message": "Số tiền không hợp lệ!"}), 400
+                update_data["balance"] = bal
+            except:
+                return jsonify({"success": False, "message": "Số tiền không hợp lệ!"}), 400
+
+        if new_coins is not None:
+            try:
+                coins = int(new_coins)
+                if coins < 0:
+                    return jsonify({"success": False, "message": "Số coin không hợp lệ!"}), 400
+                update_data["coins"] = coins
+            except:
+                return jsonify({"success": False, "message": "Số coin không hợp lệ!"}), 400
+
+        if update_data:
+            db.users.update_one({"userId": target_user}, {"$set": update_data})
+            return jsonify({"success": True, "message": f"✅ Đã cập nhật thông tin cho user {target_user}!"})
+        else:
+            return jsonify({"success": False, "message": "Không có thay đổi!"}), 400
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                users = json.load(f)
+            if target_user not in users:
+                return jsonify({"success": False, "message": "Không tìm thấy user!"}), 400
+
+            if new_balance is not None:
+                try:
+                    bal = int(new_balance)
+                    if bal < 0:
+                        return jsonify({"success": False, "message": "Số tiền không hợp lệ!"}), 400
+                    users[target_user]["balance"] = bal
+                except:
+                    return jsonify({"success": False, "message": "Số tiền không hợp lệ!"}), 400
+
+            if new_coins is not None:
+                try:
+                    coins = int(new_coins)
+                    if coins < 0:
+                        return jsonify({"success": False, "message": "Số coin không hợp lệ!"}), 400
+                    users[target_user]["coins"] = coins
+                except:
+                    return jsonify({"success": False, "message": "Số coin không hợp lệ!"}), 400
+
+            with open(USERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(users, f, indent=2)
+        return jsonify({"success": True, "message": f"✅ Đã cập nhật thông tin cho user {target_user}!"})
+
+@app.route("/get-price", methods=["GET"])
+def get_price():
+    if db is not None:
+        config = db.config.find_one({"key": "acc_price"})
+        price = config.get("value", 1600) if config else 1600
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        price = config.get("acc_price", 1600)
+    return jsonify({"success": True, "price": price})
+
+@app.route("/admin/set-price", methods=["POST"])
+def admin_set_price():
+    data = request.json or {}
+    user_id = str(data.get("userId", ""))
+    if str(user_id) != str(ADMIN_ID):
+        return jsonify({"success": False, "message": "Không có quyền!"}), 403
+
+    try:
+        new_price = int(data.get("price", 0))
+        if new_price <= 0:
+            return jsonify({"success": False, "message": "Giá phải lớn hơn 0!"}), 400
+    except:
+        return jsonify({"success": False, "message": "Giá không hợp lệ!"}), 400
+
+    global ACC_PRICE
+    ACC_PRICE = new_price
+
+    if db is not None:
+        db.config.update_one({"key": "acc_price"}, {"$set": {"value": new_price}}, upsert=True)
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                config = json.load(f)
+            config["acc_price"] = new_price
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(config, f, indent=2)
+
+    return jsonify({"success": True, "message": f"✅ Đã cập nhật giá Acc Lv5 thành {new_price:,}đ!"})
+
+# === Các API khác ===
+@app.route("/get-stock", methods=["GET"])
+def get_stock():
+    acc_type = request.args.get("type", "vip")
+    col_name = "accounts_free" if acc_type == "free" else "accounts"
+    if db is not None:
+        count = db[col_name].count_documents({})
+        return jsonify({"success": True, "stock": count})
+    else:
+        with file_lock:
+            ensure_local_files()
+            file_path = ACC_FREE_FILE if acc_type == "free" else ACC_FILE
+            with open(file_path, "r", encoding="utf-8") as f:
+                lines = [line.strip() for line in f if line.strip()]
+        return jsonify({"success": True, "stock": len(lines)})
+
+@app.route("/acclv5", methods=["POST"])
+def add_acc():
+    data = request.json or {}
+    accounts = data.get("accounts", [])
+    acc_type = data.get("type", "vip")
+    if not accounts:
+        return jsonify({"success": False, "message": "Không có acc"}), 400
+    clean_accs = [str(a).strip() for a in accounts if str(a).strip()]
+    col_name = "accounts_free" if acc_type == "free" else "accounts"
+    file_path = ACC_FREE_FILE if acc_type == "free" else ACC_FILE
+
+    if db is not None:
+        docs = [{"acc": a} for a in clean_accs]
+        if docs:
+            db[col_name].insert_many(docs)
+        total = db[col_name].count_documents({})
+        return jsonify({"success": True, "added_count": len(clean_accs), "new_stock": total})
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(file_path, "a", encoding="utf-8") as f:
+                for a in clean_accs:
+                    f.write(a + "\n")
+            with open(file_path, "r", encoding="utf-8") as f:
+                total = len([l.strip() for l in f if l.strip()])
+        return jsonify({"success": True, "added_count": len(clean_accs), "new_stock": total})
+
+@app.route("/buy-acc", methods=["POST"])
+def buy_acc():
+    data = request.json or {}
+    user_id = str(data.get("userId", ""))
+    qty = int(data.get("quantity", 1))
+    price_per_item = ACC_PRICE
+    total_price = qty * price_per_item
+
+    if db is not None:
+        user = db.users.find_one({"userId": user_id})
+        if not user:
+            return jsonify({"success": False, "message": "Không tìm thấy người dùng!"}), 400
+        if user.get("balance", 0) < total_price:
+            return jsonify({"success": False, "message": f"Số dư không đủ! Cần {total_price:,}đ."}), 400
+
+        acc_docs = list(db.accounts.find().limit(qty))
+        if len(acc_docs) < qty:
+            return jsonify({"success": False, "message": f"Kho không đủ acc! Còn {len(acc_docs)} acc."}), 400
+
+        bought_accs = [doc["acc"] for doc in acc_docs]
+        ids_to_delete = [doc["_id"] for doc in acc_docs]
+        db.accounts.delete_many({"_id": {"$in": ids_to_delete}})
+
+        new_bal = user.get("balance", 0) - total_price
+        db.users.update_one({"userId": user_id}, {"$set": {"balance": new_bal}}, upsert=True)
+
+        time_str = time.strftime("%H:%M - %d/%m/%Y")
+        db.purchases.insert_one({
+            "userId": user_id,
+            "accs": "\n".join(bought_accs),
+            "count": len(bought_accs),
+            "time": time_str,
+            "type": "vip"
+        })
+
+        # Thông báo cho admin
+        username = user.get("username", user_id)
+        msg_admin = f"🛒 **MUA ACC LV5**\nUser @{username} (ID: `{user_id}`) đã mua **{qty}** acc.\n💰 Tổng tiền: **{total_price:,}đ**\n🕒 {time_str}"
+        send_message_with_retry(ADMIN_ID, msg_admin)
+
+        return jsonify({"success": True, "accounts": bought_accs, "new_balance": new_bal})
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                users = json.load(f)
+            if user_id not in users:
+                return jsonify({"success": False, "message": "Không tìm thấy người dùng!"}), 400
+            user_bal = users[user_id].get("balance", 0)
+            if user_bal < total_price:
+                return jsonify({"success": False, "message": f"Số dư không đủ! Cần {total_price:,}đ."}), 400
+
+            with open(ACC_FILE, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f if l.strip()]
+            if len(lines) < qty:
+                return jsonify({"success": False, "message": f"Kho chỉ còn {len(lines)} acc."}), 400
+
+            bought_accs = [lines.pop(0) for _ in range(qty)]
+            with open(ACC_FILE, "w", encoding="utf-8") as f:
+                for l in lines:
+                    f.write(l + "\n")
+
+            users[user_id]["balance"] -= total_price
+            with open(USERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(users, f, indent=2)
+
+            with open(PURCHASES_FILE, "r", encoding="utf-8") as f:
+                purchases = json.load(f)
+            time_str = time.strftime("%H:%M - %d/%m/%Y")
+            purchases.insert(0, {"userId": user_id, "accs": "\n".join(bought_accs), "count": len(bought_accs), "time": time_str, "type": "vip"})
+            with open(PURCHASES_FILE, "w", encoding="utf-8") as f:
+                json.dump(purchases, f, indent=2)
+
+            # Thông báo cho admin
+            username = users[user_id].get("username", user_id)
+            msg_admin = f"🛒 **MUA ACC LV5**\nUser @{username} (ID: `{user_id}`) đã mua **{qty}** acc.\n💰 Tổng tiền: **{total_price:,}đ**\n🕒 {time_str}"
+            send_message_with_retry(ADMIN_ID, msg_admin)
+
+        return jsonify({"success": True, "accounts": bought_accs, "new_balance": users[user_id]["balance"]})
+
+@app.route("/redeem-free-acc", methods=["POST"])
+def redeem_free_acc():
+    data = request.json or {}
+    user_id = str(data.get("userId", ""))
+    qty = int(data.get("quantity", 1))
+    cost_per_acc = 5
+    total_coins_needed = qty * cost_per_acc
+    today_str = datetime.now().strftime("%d/%m/%Y")
+
+    if db is not None:
+        user = db.users.find_one({"userId": user_id})
+        if not user:
+            return jsonify({"success": False, "message": "Không tìm thấy người dùng!"}), 400
+        if user.get("is_banned", False):
+            return jsonify({"success": False, "message": "🚫 Tài khoản của bạn đã bị cấm đổi Acc Free Lv5!"}), 403
+
+        today_redeemed = db.purchases.find({
+            "userId": user_id,
+            "type": "free",
+            "date": today_str
+        })
+        already_redeemed_count = sum([p.get("count", 1) for p in today_redeemed])
+
+        if already_redeemed_count + qty > 3:
+            remains = max(0, 3 - already_redeemed_count)
+            return jsonify({
+                "success": False,
+                "message": f"⚠️ Mỗi tài khoản chỉ được đổi tối đa 3 Acc Free / ngày!\nHôm nay bạn đã đổi {already_redeemed_count}/3 acc (Còn lại: {remains} acc)."
+            }), 400
+
+        user_coins = user.get("coins", 0)
+        if user_coins < total_coins_needed:
+            return jsonify({"success": False, "message": f"Bạn không đủ Coin! Cần {total_coins_needed} Coin (Hiện có: {user_coins} Coin)."}), 400
+
+        acc_docs = list(db.accounts_free.find().limit(qty))
+        if len(acc_docs) < qty:
+            return jsonify({"success": False, "message": f"Kho Acc Free chỉ còn {len(acc_docs)} acc."}), 400
+
+        bought_accs = [doc["acc"] for doc in acc_docs]
+        ids_to_delete = [doc["_id"] for doc in acc_docs]
+        db.accounts_free.delete_many({"_id": {"$in": ids_to_delete}})
+
+        new_coins = user_coins - total_coins_needed
+        db.users.update_one({"userId": user_id}, {"$set": {"coins": new_coins}})
+
+        time_str = time.strftime("%H:%M - %d/%m/%Y")
+        db.purchases.insert_one({
+            "userId": user_id,
+            "accs": "\n".join(bought_accs),
+            "count": len(bought_accs),
+            "time": time_str + " (Đổi bằng Coin)",
+            "type": "free",
+            "date": today_str
+        })
+
+        # Thông báo cho admin
+        username = user.get("username", user_id)
+        msg_admin = f"🎁 **ĐỔI ACC FREE**\nUser @{username} (ID: `{user_id}`) đã đổi **{qty}** acc Free Lv5.\n🪙 Tổng coin: **{total_coins_needed}** Coin\n🕒 {time_str}"
+        send_message_with_retry(ADMIN_ID, msg_admin)
+
+        return jsonify({"success": True, "accounts": bought_accs, "new_coins": new_coins})
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                users = json.load(f)
+            if user_id not in users:
+                return jsonify({"success": False, "message": "Không tìm thấy người dùng!"}), 400
+            u = users[user_id]
+            if u.get("is_banned", False):
+                return jsonify({"success": False, "message": "🚫 Tài khoản của bạn đã bị cấm đổi Acc Free Lv5!"}), 403
+
+            with open(PURCHASES_FILE, "r", encoding="utf-8") as f:
+                purchases = json.load(f)
+            already_redeemed_count = sum([
+                p.get("count", 1) for p in purchases
+                if p.get("userId") == user_id and p.get("type") == "free" and p.get("date") == today_str
+            ])
+            if already_redeemed_count + qty > 3:
+                remains = max(0, 3 - already_redeemed_count)
+                return jsonify({
+                    "success": False,
+                    "message": f"⚠️ Mỗi tài khoản chỉ được đổi tối đa 3 Acc Free / ngày!\nHôm nay bạn đã đổi {already_redeemed_count}/3 acc (Còn lại: {remains} acc)."
+                }), 400
+
+            user_coins = u.get("coins", 0)
+            if user_coins < total_coins_needed:
+                return jsonify({"success": False, "message": f"Không đủ Coin! Cần {total_coins_needed} Coin (Hiện có: {user_coins} Coin)."}), 400
+
+            with open(ACC_FREE_FILE, "r", encoding="utf-8") as f:
+                lines = [l.strip() for l in f if l.strip()]
+            if len(lines) < qty:
+                return jsonify({"success": False, "message": f"Kho chỉ còn {len(lines)} acc."}), 400
+
+            bought_accs = [lines.pop(0) for _ in range(qty)]
+            with open(ACC_FREE_FILE, "w", encoding="utf-8") as f:
+                for l in lines:
+                    f.write(l + "\n")
+
+            users[user_id]["coins"] -= total_coins_needed
+            with open(USERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(users, f, indent=2)
+
+            time_str = time.strftime("%H:%M - %d/%m/%Y")
+            purchases.insert(0, {
+                "userId": user_id,
+                "accs": "\n".join(bought_accs),
+                "count": len(bought_accs),
+                "time": time_str + " (Đổi bằng Coin)",
+                "type": "free",
+                "date": today_str
+            })
+            with open(PURCHASES_FILE, "w", encoding="utf-8") as f:
+                json.dump(purchases, f, indent=2)
+
+        # Thông báo cho admin
+        username = users[user_id].get("username", user_id)
+        msg_admin = f"🎁 **ĐỔI ACC FREE**\nUser @{username} (ID: `{user_id}`) đã đổi **{qty}** acc Free Lv5.\n🪙 Tổng coin: **{total_coins_needed}** Coin\n🕒 {time_str}"
+        send_message_with_retry(ADMIN_ID, msg_admin)
+
+        return jsonify({"success": True, "accounts": bought_accs, "new_coins": users[user_id]["coins"]})
+
+@app.route("/get-purchases", methods=["GET"])
+def get_purchases():
+    user_id = str(request.args.get("userId", ""))
+    if db is not None:
+        items = list(db.purchases.find({"userId": user_id}, {"_id": 0}).sort("_id", -1).limit(50))
+        return jsonify({"success": True, "purchases": items})
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(PURCHASES_FILE, "r", encoding="utf-8") as f:
+                purchases = json.load(f)
+        user_items = [p for p in purchases if p.get("userId") == user_id][:50]
+        return jsonify({"success": True, "purchases": user_items})
+
+@app.route("/request-deposit", methods=["POST"])
+def request_deposit():
+    data = request.json or {}
+    user_id = str(data.get("userId", ""))
+    user_name = data.get("userName", "Gun")
+    amount = int(data.get("amount", 0))
+    now = time.time()
+    twenty_mins_ago = now - 20 * 60
+
+    if db is not None:
+        recent_count = db.deposits.count_documents({
+            "userId": user_id,
+            "timestamp": {"$gte": twenty_mins_ago}
+        })
+        if recent_count >= 5:
+            return jsonify({
+                "success": False,
+                "message": "⚠️ Bạn đã tạo quá 5 lệnh nạp trong 20 phút! Vui lòng chờ hết thời gian để tạo lại."
+            }), 400
+
+        dep_obj = {
+            "id": int(now * 1000),
+            "userId": user_id,
+            "userName": user_name,
+            "amount": amount,
+            "status": "pending",
+            "time": time.strftime("%H:%M - %d/%m/%Y"),
+            "timestamp": now
+        }
+        db.deposits.insert_one(dep_obj)
+        return jsonify({"success": True, "message": "Đã gửi yêu cầu nạp tiền!"})
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(DEPOSITS_FILE, "r", encoding="utf-8") as f:
+                deposits = json.load(f)
+            recent_count = len([d for d in deposits if str(d.get("userId")) == user_id and d.get("timestamp", 0) >= twenty_mins_ago])
+            if recent_count >= 5:
+                return jsonify({
+                    "success": False,
+                    "message": "⚠️ Bạn đã tạo quá 5 lệnh nạp trong 20 phút! Vui lòng chờ thêm."
+                }), 400
+            dep_obj = {
+                "id": int(now * 1000),
+                "userId": user_id,
+                "userName": user_name,
+                "amount": amount,
+                "status": "pending",
+                "time": time.strftime("%H:%M - %d/%m/%Y"),
+                "timestamp": now
+            }
+            deposits.insert(0, dep_obj)
+            with open(DEPOSITS_FILE, "w", encoding="utf-8") as f:
+                json.dump(deposits, f, indent=2)
+        return jsonify({"success": True, "message": "Đã gửi yêu cầu nạp tiền!"})
+
+@app.route("/get-deposit-history", methods=["GET"])
+def get_deposit_history():
+    user_id = str(request.args.get("userId", ""))
+    twenty_mins_ago = time.time() - 20 * 60
+
+    if db is not None:
+        query = {
+            "userId": user_id,
+            "$or": [
+                {"status": "approved"},
+                {"status": "pending", "timestamp": {"$gte": twenty_mins_ago}}
+            ]
+        }
+        items = list(db.deposits.find(query, {"_id": 0}).sort("timestamp", -1).limit(20))
+        return jsonify({"success": True, "deposits": items})
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(DEPOSITS_FILE, "r", encoding="utf-8") as f:
+                deposits = json.load(f)
+        filtered = [
+            d for d in deposits
+            if str(d.get("userId")) == user_id and (d.get("status") == "approved" or (d.get("status") == "pending" and d.get("timestamp", 0) >= twenty_mins_ago))
+        ][:20]
+        return jsonify({"success": True, "deposits": filtered})
+
+@app.route("/admin/get-all-deposits", methods=["GET"])
+def admin_get_all_deposits():
+    user_id = request.args.get("userId", "")
+    if str(user_id) != str(ADMIN_ID):
+        return jsonify({"success": False, "message": "Không có quyền truy cập!"}), 403
+
+    now = time.time()
+    ten_hours_ago = now - 10 * 3600
+    if db is not None:
+        query = {
+            "$or": [{"status": "approved"}, {"status": "pending"}],
+            "timestamp": {"$gte": ten_hours_ago}
+        }
+        items = list(db.deposits.find(query, {"_id": 0}).sort("timestamp", -1).limit(100))
+        return jsonify({"success": True, "deposits": items})
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(DEPOSITS_FILE, "r", encoding="utf-8") as f:
+                deposits = json.load(f)
+        filtered = [d for d in deposits if d.get("timestamp", 0) >= ten_hours_ago][:100]
+        return jsonify({"success": True, "deposits": filtered})
+
+@app.route("/admin/get-deposits", methods=["GET"])
+def admin_get_deposits():
+    now = time.time()
+    ten_hours_ago = now - 10 * 3600
+    if db is not None:
+        items = list(db.deposits.find({"status": "pending", "timestamp": {"$gte": ten_hours_ago}}, {"_id": 0}).sort("timestamp", -1).limit(50))
+        return jsonify({"success": True, "deposits": items})
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(DEPOSITS_FILE, "r", encoding="utf-8") as f:
+                deposits = json.load(f)
+        pending = [d for d in deposits if d.get("status") == "pending" and d.get("timestamp", 0) >= ten_hours_ago][:50]
+        return jsonify({"success": True, "deposits": pending})
+
+@app.route("/admin/approve-deposit", methods=["POST"])
+def admin_approve_deposit():
+    data = request.json or {}
+    dep_id = data.get("depositId")
+    admin_id = data.get("adminId", "")
+
+    # Kiểm tra quyền admin
+    if str(admin_id) != str(ADMIN_ID):
+        return jsonify({"success": False, "message": "Không có quyền!"}), 403
+
+    now = time.time()
+    ten_hours_ago = now - 10 * 3600
+
+    if db is not None:
+        target = db.deposits.find_one({"id": dep_id})
+        if not target:
+            return jsonify({"success": False, "message": "Không tìm thấy lệnh!"}), 400
+        if target.get("status") != "pending":
+            return jsonify({"success": False, "message": "Lệnh đã được xử lý trước đó!"}), 400
+        if target.get("timestamp", 0) < ten_hours_ago:
+            return jsonify({"success": False, "message": "Lệnh đã quá hạn 10 tiếng!"}), 400
+
+        # Cập nhật trạng thái thành approved
+        db.deposits.update_one({"id": dep_id}, {"$set": {"status": "approved"}})
+        uid = target["userId"]
+        amt = target["amount"]
+        db.users.update_one({"userId": uid}, {"$inc": {"balance": amt}}, upsert=True)
+
+        # Gửi tin nhắn cho khách hàng (người nạp)
+        user = db.users.find_one({"userId": uid}) or {}
+        username = user.get("username", uid)
+        msg_user = f"✅ **DUYỆT NẠP TIỀN THÀNH CÔNG!**\n\nBạn đã được cộng **{amt:,}đ** vào tài khoản.\nSố dư hiện tại: {user.get('balance', 0):,}đ\nCảm ơn bạn đã sử dụng dịch vụ! 🚀"
+        send_message_with_retry(uid, msg_user)
+
+        # Gửi tin nhắn xác nhận cho admin
+        msg_admin = f"✅ **ĐÃ DUYỆT NẠP**\nAdmin đã duyệt cộng **{amt:,}đ** cho user @{username} (ID: `{uid}`)."
+        send_message_with_retry(ADMIN_ID, msg_admin)
+
+        return jsonify({"success": True, "message": f"✅ Đã duyệt cộng {amt:,}đ cho ID {uid}!"})
+    else:
+        with file_lock:
+            ensure_local_files()
+            with open(DEPOSITS_FILE, "r", encoding="utf-8") as f:
+                deposits = json.load(f)
+            target = None
+            for d in deposits:
+                if d.get("id") == dep_id:
+                    target = d
+                    break
+            if not target:
+                return jsonify({"success": False, "message": "Không tìm thấy lệnh!"}), 400
+            if target.get("status") != "pending":
+                return jsonify({"success": False, "message": "Lệnh đã được xử lý trước đó!"}), 400
+            if target.get("timestamp", 0) < ten_hours_ago:
+                return jsonify({"success": False, "message": "Lệnh đã quá hạn 10 tiếng!"}), 400
+
+            target["status"] = "approved"
+            with open(DEPOSITS_FILE, "w", encoding="utf-8") as f:
+                json.dump(deposits, f, indent=2)
+
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                users = json.load(f)
+            uid = target["userId"]
+            if uid not in users:
+                users[uid] = {"balance": 0}
+            users[uid]["balance"] += target["amount"]
+            username = users[uid].get("username", uid)
+            with open(USERS_FILE, "w", encoding="utf-8") as f:
+                json.dump(users, f, indent=2)
+
+            # Gửi tin nhắn cho khách hàng
+            msg_user = f"✅ **DUYỆT NẠP TIỀN THÀNH CÔNG!**\n\nBạn đã được cộng **{target['amount']:,}đ** vào tài khoản.\nSố dư hiện tại: {users[uid]['balance']:,}đ\nCảm ơn bạn đã sử dụng dịch vụ! 🚀"
+            send_message_with_retry(uid, msg_user)
+
+            msg_admin = f"✅ **ĐÃ DUYỆT NẠP**\nAdmin đã duyệt cộng **{target['amount']:,}đ** cho user @{username} (ID: `{uid}`)."
+            send_message_with_retry(ADMIN_ID, msg_admin)
+
+        return jsonify({"success": True, "message": f"✅ Đã duyệt cộng {target['amount']:,}đ cho ID {uid}!"})
+
+@app.route("/is-admin", methods=["GET"])
+def is_admin():
+    user_id = request.args.get("userId", "")
+    return jsonify({"isAdmin": str(user_id) == str(ADMIN_ID)})
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
