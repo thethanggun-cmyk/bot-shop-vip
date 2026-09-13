@@ -1,0 +1,56 @@
+{
+  "shopInfo": {
+    "name": "Mih Quân - Store Hack",
+    "notice": "CỬA HÀNG SẴN SÀNG - VUI LÒNG CHỌN SẢN PHẨM",
+    "bankCode": "MB",
+    "bankAccount": "0365908079",
+    "accountName": "LE MINH QUAN"
+  },
+  "bankApi": {
+    "url": "https://thueapibank.vn/historyapimbbank/{token}",
+    "token": "e70fe684dea3da0cb1b088c1c3d0c605",
+    "prefix": "MIHQUAN"
+  },
+  "theme": {
+    "primary": "#00e5ff",
+    "secondary": "#0070f3",
+    "bgBase": "#080c14",
+    "bgCard": "#0e1624",
+    "border": "#1a2a44"
+  },
+  "uiText": {
+    "shopName": "Mih Quân - Store Hack",
+    "shopNotice": "CỬA HÀNG SẴN SÀNG - VUI LÒNG CHỌN SẢN PHẨM"
+  },
+  "categories": [],
+  "products": [],
+  "recentTransactions": [],
+  "processedTxCodes": [],
+  "users": {},
+  "vouchers": {
+    "MIHQUAN2026": {
+      "type": "balance",
+      "amount": 20000,
+      "usedBy": []
+    },
+    "TRIAN50K": {
+      "type": "balance",
+      "amount": 50000,
+      "usedBy": []
+    }
+  },
+  "giftcodes": {
+    "FREEKEYVIP": {
+      "type": "key",
+      "productName": "Key VIP MihQuan",
+      "key": "MIHQUAN-VIP-TEST-888",
+      "usedBy": []
+    },
+    "TANTHU": {
+      "type": "balance",
+      "amount": 10000,
+      "usedBy": []
+    }
+  },
+  "musicUrl": ""
+}
