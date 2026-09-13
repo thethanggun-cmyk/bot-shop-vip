@@ -13,7 +13,7 @@ VN_TZ = timezone(timedelta(hours=7))
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8978285583:AAHfPf188aX9t83v_qFIkwP1G7182YBelss").strip()
 
-ADMIN_IDS = [7775104850, 6476569159]
+ADMIN_IDS = [8348411770, 8348411770]
 env_admins = os.getenv("ADMIN_IDS")
 if env_admins:
     ADMIN_IDS = [int(x.strip()) for x in env_admins.split(",") if x.strip().isdigit()]
